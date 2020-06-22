@@ -1,10 +1,12 @@
 package ftl.json
 
-import com.google.api.client.json.GenericJson
 import com.google.api.services.testing.model.TestMatrix
 import com.google.api.services.toolresults.model.Outcome
 import ftl.android.AndroidCatalog
 import ftl.gc.GcToolResults
+import ftl.reports.api.createTestExecutionDataListAsync
+import ftl.reports.api.createTestSuitOverviewData
+import ftl.reports.api.data.TestSuiteOverviewData
 import ftl.util.Billing
 import ftl.util.MatrixState.FINISHED
 import ftl.util.StepOutcome.failure
@@ -12,8 +14,15 @@ import ftl.util.StepOutcome.flaky
 import ftl.util.StepOutcome.inconclusive
 import ftl.util.StepOutcome.skipped
 import ftl.util.StepOutcome.success
-import ftl.util.StepOutcome.unset
+import ftl.util.getDetails
 import ftl.util.webLink
+
+private data class FinishedTestMatrixData(
+    val stepOutcome: Outcome,
+    val isVirtualDevice: Boolean,
+    val testSuiteOverviewData: TestSuiteOverviewData?,
+    val billableMinutes: Long?
+)
 
 // execution gcs paths aren't API accessible.
 class SavedMatrix(matrix: TestMatrix) {
@@ -81,23 +90,25 @@ class SavedMatrix(matrix: TestMatrix) {
         outcome = success
         if (matrix.testExecutions == null) return
 
-        matrix.testExecutions.forEach {
-            val executionResult = GcToolResults.getExecutionResult(it)
-            updateOutcome(executionResult.outcome)
+        updateFinishedMatrixData(matrix)
+    }
 
-            // testExecutionStep, testTiming, etc. can all be null.
-            // sometimes testExecutionStep is present and testTiming is null
-            val stepResult = GcToolResults.getStepResult(it.toolResultsStep)
-            val testTimeSeconds = stepResult.testExecutionStep?.testTiming?.testProcessDuration?.seconds ?: return
-
-            val billableMinutes = Billing.billableMinutes(testTimeSeconds)
-
-            if (AndroidCatalog.isVirtualDevice(it.environment?.androidDevice, matrix.projectId ?: "")) {
-                billableVirtualMinutes += billableMinutes
-            } else {
-                billablePhysicalMinutes += billableMinutes
+    private fun updateFinishedMatrixData(matrix: TestMatrix) {
+        matrix.testExecutions.createTestExecutionDataListAsync()
+            .map {
+                FinishedTestMatrixData(
+                    stepOutcome = GcToolResults.getExecutionResult(it.testExecution).outcome,
+                    isVirtualDevice = AndroidCatalog.isVirtualDevice(it.testExecution.environment.androidDevice, matrix.projectId.orEmpty()),
+                    testSuiteOverviewData = it.createTestSuitOverviewData(),
+                    billableMinutes = it.step.testExecutionStep?.testTiming?.testProcessDuration?.seconds
+                        ?.let { testTimeSeconds -> Billing.billableMinutes(testTimeSeconds) }
+                )
             }
-        }
+            .forEach { (stepOutcome, isVirtualDevice, testSuiteOverviewData, billableMinutes) ->
+                updateOutcome(stepOutcome)
+                updateOutcomeDetails(stepOutcome, testSuiteOverviewData)
+                billableMinutes?.let { updateBillableMinutes(it, isVirtualDevice) }
+            }
     }
 
     private fun updateOutcome(stepOutcome: Outcome) {
@@ -110,19 +121,18 @@ class SavedMatrix(matrix: TestMatrix) {
 
         // Treat flaky outcome as a success
         if (outcome == flaky) outcome = success
-
-        outcomeDetails = when (outcome) {
-            failure -> stepOutcome.failureDetail.keysToString()
-            success -> stepOutcome.successDetail.keysToString()
-            inconclusive -> stepOutcome.inconclusiveDetail.keysToString()
-            skipped -> stepOutcome.skippedDetail.keysToString()
-            unset -> "unset"
-            else -> "unknown"
-        }
     }
 
-    private fun GenericJson?.keysToString(): String {
-        return this?.keys?.joinToString(",") ?: ""
+    private fun updateOutcomeDetails(stepOutcome: Outcome, testSuiteOverviewData: TestSuiteOverviewData?) {
+        outcomeDetails = stepOutcome.getDetails(testSuiteOverviewData) ?: "---"
+    }
+
+    private fun updateBillableMinutes(billableMinutes: Long, isVirtualDevice: Boolean) {
+        if (isVirtualDevice) {
+            billableVirtualMinutes += billableMinutes
+        } else {
+            billablePhysicalMinutes += billableMinutes
+        }
     }
 
     val gcsPathWithoutRootBucket get() = gcsPath.substringAfter('/')
